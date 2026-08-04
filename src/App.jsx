@@ -649,15 +649,201 @@ function Onboarding({ onDone }) {
   );
 }
 
+// ─── OAuth 설정 ───────────────────────────────────────────────────────────────
+const KAKAO_JS_KEY = import.meta.env.VITE_KAKAO_JS_KEY;
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+const REDIRECT_BASE = "https://parkinson-care-three.vercel.app";
+
+// 카카오 SDK 동적 로드
+const loadKakaoSDK = () =>
+  new Promise((resolve, reject) => {
+    if (window.Kakao) {
+      if (!window.Kakao.isInitialized()) window.Kakao.init(KAKAO_JS_KEY);
+      resolve(window.Kakao);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = "https://t1.kakaocdn.net/kakao_js_sdk/2.7.2/kakao.min.js";
+    s.crossOrigin = "anonymous";
+    s.onload = () => {
+      window.Kakao.init(KAKAO_JS_KEY);
+      resolve(window.Kakao);
+    };
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+
+// 구글 GSI SDK 동적 로드
+const loadGoogleSDK = () =>
+  new Promise((resolve, reject) => {
+    if (window.google?.accounts) {
+      resolve(window.google.accounts);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = "https://accounts.google.com/gsi/client";
+    s.onload = () => resolve(window.google.accounts);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+
+// JWT payload 파싱 (서명 검증 없이 표시용)
+const parseJwt = (token) => {
+  try {
+    return JSON.parse(atob(token.split(".")[1]));
+  } catch {
+    return null;
+  }
+};
+
 // ─── 로그인 화면 ──────────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }) {
   const [mode, setMode] = useState("main");
   const [guestName, setGuestName] = useState("");
-  const [toast, setToast] = useState("");
+  const [loading, setLoading] = useState("");
+  const [error, setError] = useState("");
+  const googleBtnRef = useRef(null);
 
-  const showToast = (msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(""), 2500);
+  // 카카오/구글 리다이렉트 콜백 처리
+  useEffect(() => {
+    const path = window.location.pathname;
+
+    // ── 카카오 콜백 ──
+    if (path === "/kakao") {
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get("code");
+      if (!code) return;
+      setLoading("kakao");
+      loadKakaoSDK()
+        .then((Kakao) => {
+          // redirect 방식에서 authorization code → access token은 서버 필요
+          // 대신 JS SDK의 authorize 후 자동 팝업 완료 처리
+          // 여기서는 code를 받은 뒤 사용자 정보 API 직접 호출 (PKCE flow)
+          fetch("https://kauth.kakao.com/oauth/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              grant_type: "authorization_code",
+              client_id: KAKAO_JS_KEY,
+              redirect_uri: `${REDIRECT_BASE}/kakao`,
+              code,
+            }),
+          })
+            .then((r) => r.json())
+            .then((tokenData) => {
+              if (!tokenData.access_token) throw new Error("token_fail");
+              Kakao.Auth.setAccessToken(tokenData.access_token);
+              return Kakao.API.request({ url: "/v2/user/me" });
+            })
+            .then((res) => {
+              const user = {
+                id: `kakao_${res.id}`,
+                name: res.kakao_account?.profile?.nickname || "카카오 사용자",
+                avatar: res.kakao_account?.profile?.thumbnail_image_url || "🐱",
+                type: "kakao",
+                email: res.kakao_account?.email || "",
+              };
+              save(K.user, user);
+              window.history.replaceState({}, "", "/");
+              onLogin(user);
+            })
+            .catch(() => {
+              setError(
+                "카카오 로그인 중 오류가 발생했어요. 다시 시도해주세요.",
+              );
+              setLoading("");
+              window.history.replaceState({}, "", "/");
+            });
+        })
+        .catch(() => {
+          setError("카카오 SDK를 불러오지 못했어요.");
+          setLoading("");
+        });
+    }
+
+    // ── 구글 콜백 (hash fragment) ──
+    if (path === "/google") {
+      const hash = new URLSearchParams(window.location.hash.slice(1));
+      const idToken =
+        hash.get("id_token") ||
+        new URLSearchParams(window.location.search).get("credential");
+      if (!idToken) return;
+      const payload = parseJwt(idToken);
+      if (payload) {
+        const user = {
+          id: `google_${payload.sub}`,
+          name: payload.name || "구글 사용자",
+          avatar: payload.picture || "🐱",
+          type: "google",
+          email: payload.email || "",
+        };
+        save(K.user, user);
+        window.history.replaceState({}, "", "/");
+        onLogin(user);
+      } else {
+        setError("구글 로그인 처리 중 오류가 발생했어요.");
+        window.history.replaceState({}, "", "/");
+      }
+    }
+  }, []);
+
+  // 구글 GSI 버튼 렌더링
+  useEffect(() => {
+    if (mode !== "main" || !googleBtnRef.current) return;
+    let cancelled = false;
+    loadGoogleSDK()
+      .then((accounts) => {
+        if (cancelled || !googleBtnRef.current) return;
+        accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID,
+          callback: (response) => {
+            const payload = parseJwt(response.credential);
+            if (!payload) {
+              setError("구글 로그인 처리 중 오류가 발생했어요.");
+              return;
+            }
+            const user = {
+              id: `google_${payload.sub}`,
+              name: payload.name || "구글 사용자",
+              avatar: payload.picture || "🐱",
+              type: "google",
+              email: payload.email || "",
+            };
+            save(K.user, user);
+            onLogin(user);
+          },
+          ux_mode: "popup",
+        });
+        accounts.id.renderButton(googleBtnRef.current, {
+          type: "standard",
+          shape: "rectangular",
+          theme: "outline",
+          text: "signin_with",
+          size: "large",
+          logo_alignment: "left",
+          width: Math.min(320, window.innerWidth - 56),
+          locale: "ko",
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
+  const handleKakao = async () => {
+    setError("");
+    setLoading("kakao");
+    try {
+      const Kakao = await loadKakaoSDK();
+      Kakao.Auth.authorize({
+        redirectUri: `${REDIRECT_BASE}/kakao`,
+        scope: "profile_nickname,profile_image,account_email",
+      });
+    } catch {
+      setError("카카오 SDK를 불러오지 못했어요. 잠시 후 다시 시도해주세요.");
+      setLoading("");
+    }
   };
 
   const handleGuest = () => {
@@ -672,10 +858,27 @@ function LoginScreen({ onLogin }) {
     onLogin(user);
   };
 
-  const handleKakao = () =>
-    showToast("카카오 로그인은 앱 출시 후 이용 가능해요 🐾");
-  const handleGoogle = () =>
-    showToast("구글 로그인은 앱 출시 후 이용 가능해요 🐾");
+  // 카카오 로딩 중 스플래시
+  if (loading === "kakao")
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: "#FEE500",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 24,
+          fontFamily: "inherit",
+        }}
+      >
+        <div style={{ fontSize: 56 }}>🐱</div>
+        <div style={{ fontSize: 16, fontWeight: 700, color: "#3C1E1E" }}>
+          카카오로 이동 중...
+        </div>
+      </div>
+    );
 
   return (
     <div
@@ -693,27 +896,8 @@ function LoginScreen({ onLogin }) {
           "'Pretendard','Apple SD Gothic Neo','Noto Sans KR',sans-serif",
       }}
     >
-      {toast && (
-        <div
-          style={{
-            position: "fixed",
-            top: 60,
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: C.text,
-            color: "#fff",
-            borderRadius: 12,
-            padding: "12px 20px",
-            fontSize: 14,
-            zIndex: 9999,
-            whiteSpace: "nowrap",
-            boxShadow: "0 4px 16px #0003",
-          }}
-        >
-          {toast}
-        </div>
-      )}
-      <div style={{ textAlign: "center", marginBottom: 48 }}>
+      {/* 로고 */}
+      <div style={{ textAlign: "center", marginBottom: 44 }}>
         <div style={{ fontSize: 64, marginBottom: 12 }}>🐱</div>
         <div style={{ fontSize: 28, fontWeight: 900, color: C.text }}>
           파<span style={{ color: C.accent }}>캣</span>슨
@@ -722,6 +906,24 @@ function LoginScreen({ onLogin }) {
           파킨슨 환자와 가족을 위한 케어 앱
         </div>
       </div>
+
+      {error && (
+        <div
+          style={{
+            background: C.redSoft,
+            border: `1px solid ${C.red}44`,
+            borderRadius: 12,
+            padding: "12px 16px",
+            marginBottom: 16,
+            fontSize: 13,
+            color: C.red,
+            width: "100%",
+            textAlign: "center",
+          }}
+        >
+          ⚠️ {error}
+        </div>
+      )}
 
       {mode === "main" && (
         <div
@@ -732,6 +934,7 @@ function LoginScreen({ onLogin }) {
             gap: 14,
           }}
         >
+          {/* 카카오 */}
           <button
             onClick={handleKakao}
             style={{
@@ -744,77 +947,70 @@ function LoginScreen({ onLogin }) {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              gap: 10,
+              gap: 12,
               fontFamily: "inherit",
               fontWeight: 700,
               fontSize: 15,
               color: "#3C1E1E",
             }}
           >
-            <span style={{ fontSize: 20 }}>💬</span> 카카오로 시작하기
+            <svg width="20" height="20" viewBox="0 0 40 40" fill="none">
+              <path
+                fillRule="evenodd"
+                clipRule="evenodd"
+                d="M20 4C11.163 4 4 10.044 4 17.5c0 4.784 2.983 8.985 7.5 11.39L9.6 36l8.1-5.4c.76.1 1.53.15 2.3.15 8.837 0 16-6.044 16-13.5S28.837 4 20 4z"
+                fill="#3C1E1E"
+              />
+            </svg>
+            카카오로 시작하기
           </button>
-          <button
-            onClick={handleGoogle}
-            style={{
-              width: "100%",
-              padding: "16px",
-              borderRadius: 14,
-              border: `1.5px solid ${C.border}`,
-              cursor: "pointer",
-              background: C.white,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 10,
-              fontFamily: "inherit",
-              fontWeight: 700,
-              fontSize: 15,
-              color: C.text,
-            }}
-          >
-            <span style={{ fontSize: 20 }}>🌐</span> 구글로 시작하기
-          </button>
+
+          {/* 구글 (GSI 버튼이 렌더링됨) */}
           <div
             style={{
+              width: "100%",
               display: "flex",
-              alignItems: "center",
-              gap: 12,
-              margin: "4px 0",
+              justifyContent: "center",
+              minHeight: 50,
             }}
           >
+            <div ref={googleBtnRef} style={{ width: "100%" }} />
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <div style={{ flex: 1, height: 1, background: C.border }} />
             <span style={{ fontSize: 12, color: C.textDim }}>또는</span>
             <div style={{ flex: 1, height: 1, background: C.border }} />
           </div>
+
+          {/* 게스트 */}
           <button
             onClick={() => setMode("guest")}
             style={{
               width: "100%",
-              padding: "16px",
+              padding: "15px",
               borderRadius: 14,
               border: `1.5px solid ${C.border}`,
               cursor: "pointer",
               background: "transparent",
               fontFamily: "inherit",
               fontWeight: 600,
-              fontSize: 15,
+              fontSize: 14,
               color: C.textMuted,
             }}
           >
             로그인 없이 시작하기
           </button>
+
           <div
             style={{
               textAlign: "center",
               fontSize: 11,
               color: C.textDim,
-              marginTop: 4,
               lineHeight: 1.7,
             }}
           >
-            카카오·구글 로그인은 앱 출시 후 이용 가능합니다
-            <br />
-            지금은 게스트로 모든 기능을 사용하실 수 있어요 🐾
+            로그인 시 이용약관 및 개인정보처리방침에 동의하게 됩니다
           </div>
         </div>
       )}
@@ -864,6 +1060,9 @@ function LoginScreen({ onLogin }) {
           >
             🐱 시작하기
           </Btn>
+          <div style={{ textAlign: "center", fontSize: 12, color: C.textDim }}>
+            기기에만 저장돼요 · 나중에 소셜 계정 연동 가능해요
+          </div>
         </div>
       )}
     </div>

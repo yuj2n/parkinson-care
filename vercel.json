@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/kakao", "destination": "/index.html" },
+    { "source": "/google", "destination": "/index.html" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
