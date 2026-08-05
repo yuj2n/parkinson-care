@@ -838,7 +838,7 @@ function LoginScreen({ onLogin }) {
       const Kakao = await loadKakaoSDK();
       Kakao.Auth.authorize({
         redirectUri: `${REDIRECT_BASE}/kakao`,
-        scope: "profile_nickname,profile_image,account_email",
+        scope: "profile_nickname,profile_image",
       });
     } catch {
       setError("카카오 SDK를 불러오지 못했어요. 잠시 후 다시 시도해주세요.");
